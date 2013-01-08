@@ -1,0 +1,495 @@
+#!/usr/bin/perl -w
+#
+# l8tr
+#
+# Copyright (c) 2006 John Graham-Cumming
+
+use strict;
+use warnings;
+
+use Digest::MD5 qw( md5_hex );
+use LWP::UserAgent;
+use HTML::Strip;
+
+use Email::Send qw[Sendmail];
+$Email::Send::Sendmail::SENDMAIL = '/usr/sbin/sendmail';
+
+use Storable qw( lock_store lock_retrieve );
+use L8tr;
+
+# Subkeys
+#
+# $$watch{$url}
+#             {count}    - Number of times checked
+#             {next}     - Next time to look this up
+#             {interval} - Seconds to next lookup
+#             {time}   - Last time someone asked for this
+#             {cache}  - The hash of the URL for the cache
+#             {who}    - The users who are waiting for this
+#             {hash}   - Hash of the cached data
+#             {state}  - 0 (not yet looked up)
+#                        1 (retrieved ok, send message)
+#                        2 (small, needs manual intervention)
+#                        3 (wait for hash change)
+#                        4 (spam?, needs manual intervention)
+#                        5 (delete this entry)
+
+my $html = new HTML::Strip;
+
+$html->clear_striptags();
+$html->set_striptags( [ 'style', 'script', 'applet' ] );
+
+my $quarantine = 0;
+my $reason = '';
+
+write_log( "Starting run" );
+
+my $watch = {};
+
+if ( -e $L8tr::storage ) {
+    $watch = lock_retrieve $L8tr::storage;
+}
+
+rename( $L8tr::add, $L8tr::process );
+
+# STEP 1: Insert any new URLs that need monitoring
+
+if ( open ADD, "<$L8tr::process" ) {
+    while ( <ADD> ) {
+        chomp;
+        my ( $url, $email, $ip ) = split / /;
+
+        if ( !exists( $$watch{$url} ) ) {
+            my $now = time;
+            $$watch{$url}{cache}    = md5_hex( "${now}woefjiwe${url}heijhfw" );
+            $$watch{$url}{state}    = $L8tr::STATE_NONE;
+            $$watch{$url}{who}      = '';
+            $$watch{$url}{hash}     = '';
+            $$watch{$url}{filename} = '';
+            $$watch{$url}{elapsed}  = -1;
+            $$watch{$url}{next}     = time;
+            $$watch{$url}{count}    = 0;
+            $$watch{$url}{interval} = $L8tr::start_interval;
+        }
+
+        $$watch{$url}{time} = time;
+
+        if ( $$watch{$url}{who} !~ / $email\// ) {
+            $$watch{$url}{who} .= " $email/$ip";
+        }
+
+        write_log( "Will monitor $url for $email" );
+    }
+
+    close ADD;
+
+    unlink '/home/jgc/l8tr.processing';
+}
+
+
+# STEP 2: Check here for a web site which has received many requests
+# since the last pass and quarantine it for me to look at
+
+foreach my $url (keys %$watch) {
+    next if ( $$watch{$url}{state} != $L8tr::STATE_NONE );
+    my @emails = split( ' ', $$watch{$url}{who} );
+
+    if ( $#emails > 100 ) {
+        my %ips;
+        foreach my $ei (@emails) {
+            my ( $email, $ip ) = split( /\//, $ei );
+            $ips{$ip}++;
+        }
+
+        my $ok = 1;
+        foreach my $ip (keys %ips) {
+            if ( $ips{$ip} > 10 ) {
+                $ok = 0;
+                last;
+            }
+        }
+
+        if ( !$ok ) {
+            write_log( "Suspicious $url:$$watch{$url}{who}" );
+            $$watch{$url}{state} = $L8tr::STATE_SPAM;
+        }
+    }
+}
+
+# STEP 3: Retrieve any URLs that are in the NONE or HASH states
+
+my $ua = LWP::UserAgent->new;
+$ua->agent("l8tr-agent/0.1");
+$ua->timeout( 30 );
+$ua->protocols_allowed( [ 'http', 'https' ] );
+
+foreach my $url (keys %$watch) {
+    next if ( ( $$watch{$url}{state} != $L8tr::STATE_NONE ) &&
+              ( $$watch{$url}{state} != $L8tr::STATE_HASH ) );
+
+    next if ( time < $$watch{$url}{next} );
+
+    write_log( "Testing $url $$watch{$url}{who}" );
+    my $fixed_url = $url;
+    if ( $url !~ /^https?:/ ) {
+        $fixed_url = 'http://' . $url;
+    }
+
+    my $elapsed = time;
+    my $tmp   = "/tmp/$$watch{$url}{cache}";
+    my $res = $ua->get( $fixed_url, ':content_file' => $tmp );
+    $elapsed = time - $elapsed;
+
+    $$watch{$url}{count} += 1;
+
+    if ( available( $res, $tmp, $elapsed ) ) {
+        write_log( "$url is available ($elapsed)" );
+
+        my $c = `cat $tmp`;
+        my $hash = md5_hex( $c );
+
+        mkdir "/var/www/cache/$$watch{$url}{cache}";
+
+        my $co = undef;
+
+        if ( $res->content_type =~ /html/ ) {
+            $co = `cat $tmp`;
+            if ( $co !~ /<base/i ) {
+                my $b = $res->base;
+                my $base = "<base href=\"$b\">";
+                $co =~ s/<\/head>/$base<\/head>/i;
+            }
+        }
+
+        $url =~ /([^\/]+)$/;
+        my $last = $1;
+        if ( !defined( $last ) || ( $res->content_type =~ /html/ ) ) {
+            $last = 'cached.html';
+        } else {
+            if ( $last !~ /\.([a-z]+)$/i ) {
+                $last = 'cached.html';
+            } else {
+                $last = "cached.$1";
+            }
+        }
+
+        $$watch{$url}{filename} = $last;
+        $$watch{$url}{elapsed}  = $elapsed;
+        my $cache = "/var/www/cache/$$watch{$url}{cache}/$last";
+        write_log( "Caching $url in $cache" );
+        if ( defined( $co ) ) {
+            open CACHE, ">$cache";
+            print CACHE $co;
+            close CACHE;
+            unlink $tmp;
+        } else {
+            rename $tmp, $cache;
+        }
+
+        if ( $$watch{$url}{state} == $L8tr::STATE_HASH ) {
+            if ( $hash ne $$watch{$url}{hash} ) {
+                $$watch{$url}{state} = $L8tr::STATE_OK;
+            } else {
+                $$watch{$url}{next} += $$watch{$url}{interval};
+
+                if ( $$watch{$url}{interval} < $L8tr::max_interval ) {
+                    $$watch{$url}{interval} *= 2;
+                }
+            }
+        } else {
+            if ( ( -s $cache ) < 2000 ) {
+#                $$watch{$url}{state} = $L8tr::STATE_OK;
+                $$watch{$url}{state} = $L8tr::STATE_SMALL;
+            } else {
+                $reason = '';
+
+                my $stripped = $html->parse( $c );
+                $html->eof;
+
+                $quarantine = ( $stripped =~ /\b(error|offline|off-line|disabled|unavailable|maintenance|inconvenience|suspended|bandwidth|under construction)\b/i );
+
+                if ( $quarantine ) {
+                    $reason = 'contains: ' . $1;
+                    $$watch{$url}{state} = $L8tr::STATE_SMALL;
+                    $$watch{$url}{reason} = $reason;
+                } else {
+                    $$watch{$url}{state} = $L8tr::STATE_OK;
+                    $$watch{$url}{reason} = '';
+                }
+            }
+        }
+
+        $$watch{$url}{hash} = $hash;
+    } else {
+        write_log( "$url is not available ($elapsed) (" . $res->status_line . ")" );
+        unlink $tmp;
+
+        $$watch{$url}{next} += $$watch{$url}{interval};
+        $$watch{$url}{reason} = $reason;
+
+        if ( $$watch{$url}{interval} < $L8tr::max_interval ) {
+            $$watch{$url}{interval} *= 2;
+        }
+    }
+}
+
+# STEP 4: Remove any entries that have now been delivered
+
+foreach my $url (keys %$watch) {
+    next if ( $$watch{$url}{state} != $L8tr::STATE_DELIVERED );
+    delete $$watch{$url};
+}
+
+# STEP 5: Send emails for any entries that are in the OK state
+
+foreach my $url (keys %$watch) {
+    next if ( $$watch{$url}{state} != $L8tr::STATE_OK );
+
+    my @emails = split( ' ', $$watch{$url}{who} );
+
+    foreach my $ei (@emails) {
+        my ( $email, $ip ) = split( /\//, $ei );
+        write_log( "Sending mail to $email for $url using $Email::Send::Sendmail::SENDMAIL" );
+        my $message = available_msg( $url, $email, $$watch{$url}{cache},
+                                     $$watch{$url}{filename},
+                                     $$watch{$url}{elapsed} );
+        send Sendmail => $message;
+    }
+
+    $$watch{$url}{state} = $L8tr::STATE_DELIVERED;
+}
+
+# STEP 6: Time out any entries that are too old
+
+foreach my $url (keys %$watch) {
+    next if ( $$watch{$url}{state} == $L8tr::STATE_DELIVERED );
+    if ( time > ( $$watch{$url}{time} + 60 * 60 * 24 * 7 ) ) {
+        my @emails = split( ' ', $$watch{$url}{who} );
+        foreach my $ei (@emails) {
+            my ( $email, $ip ) = split( /\//, $ei );
+            write_log( "Giving up on $url and emailing $email using $Email::Send::Sendmail::SENDMAIL" );
+            my $message = failed_msg( $url, $email );
+            send Sendmail => $message;
+        }
+            delete $$watch{$url};
+    }
+}
+
+# STEP 7: Delete any marked as to be killed
+
+foreach my $url (keys %$watch) {
+    if ( $$watch{$url}{state} == $L8tr::STATE_KILL ) {
+        delete $$watch{$url};
+    }
+}
+
+write_log( "Ending run" );
+
+lock_store $watch, $L8tr::storage;
+
+sub write_log
+{
+    my ( $message ) = @_;
+
+    if ( open LOG, '>>/var/log/l8tr.log' ) {
+        print LOG timestamp(),",$message\n";
+        close LOG;
+    }
+}
+
+sub timestamp
+{
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)=localtime(time);
+
+    return sprintf( "%4d%02d%02dT%02d%02d%02dZ", $year+1900,$mon+1,$mday,$hour,$min,$sec );
+}
+
+sub available
+{
+    my ( $res, $tmp, $elapsed ) = @_;
+
+    $reason = 'More then 30 seconds';
+    return 0 if ( $elapsed > 30 );
+    $reason = 'Failed to download';
+    return 0 if ( !$res->is_success );
+    $reason = 'Content is empty';
+    return 0 if ( -z $tmp );
+    $reason = 'Content less than 256 bytes';
+    return 0 if ( ( -s $tmp ) < 256 );
+    $reason = 'Content-Length is 0';
+    return 0 if ( defined( $res->content_length ) &&
+                  ( $res->content_length == 0 ) );
+
+    if ( $res->content_type =~ /html/ ) {
+        my $c = `cat $tmp`;
+
+        $reason = 'Cache file is empty';
+        return 0 if ( $c eq '' );
+
+        my $stripped = $c;
+
+        # Heuristics for determining whether a page that looks ok is
+        # actually dead
+
+        my @patterns = (
+           'Too many connections in',
+           'is blocked because of many connection errors',
+           'Error establishing a database connection',
+           'sito in costruzione',
+           ' Sito offline per manutenzione',
+           'THIS WEBSITE IS UNDER MAINTENANCE',
+           'Please check back later',
+           'ESTAMOS TRABAJANDO EN ESTA WEB',
+           'please come back when the storm is over',
+           'This website has exceeded the allowed monthly data transfer limit',
+           'Due to overwhelming demand we\'ve had to significantly increase available capacity',
+           'Daily bandwidth limitations for this picture have been reached',
+           'Error 404 - The page cannot be found',
+           'Fatal error: require_once',
+           'Error: <strong>Unable to connect to PostgreSQL server\.<\/strong>',
+	   'expired on \d+\/\d+\/\d+ and is pending renewal or deletion',
+           '<title>503 Service Temporarily Unavailable<\/title>',
+	   'Temporarily Unavailable<\/title>',
+           'We\'ll be back as soon as possible',
+           'We\.ll be back as soon as possible',
+           'The site you were trying to reach does not currently have a default page',
+	   'HTTP\/1\.0 404 Object Not Found',
+           'Our site is temporarily closed',
+	   'This site is currently under development',
+           '<b>Fatal error<\/b>:  Unknown: Failed opening required',
+           'Our site is temporarily unavailable, but will be back online shortly',
+           'Account temporarily down for Maintenance',
+           'Visitors, we are sorry, however, this site is experiencing difficulties at this time',
+           'Could not connect to master server',
+           'You have requested a site that is currently offline',
+           '<title>WordPress &rsaquo; Error<\/title>',
+           '<title>Server too busy!<\/title>',
+           '<title>Application Error<\/title>',
+           '<title>Website Disabled<\/title>',
+           '<title>Web Site Unavailable<\/title>',
+           '<title>Account Suspended<\/title>',
+           '<title>Temporarily Unavailable<\/title>',
+           '<title>Account over quota<\/title>',
+           '<title>Service temporarly unavailable<\/title>',
+           '<title>[^<]*Fatal Error[^<]*<\/title>',
+           '<title>[^<]*An Error has Occurred[^<]*<\/title>',
+           'taken down the site',
+           'WordPress database error',
+           'Having a few problems with our somewhat unexpected growth spurt',
+           'connect to local MySQL server',
+           'This Account Has Been Suspended',
+           'This site is temporarily unavailable',
+           'This website is currently unavailable',
+           'This Account Has Exceeded Its CPU Quota',
+           '>Bandwidth reached\.\.\.<',
+           'We apologize for the inconvenience',
+           'an unexpected error has occured',
+           'its bandwidth has been exceeded',
+           '^mySQL error:',
+           'There was an accident with the database',
+           '404 - Page Not Found',
+           'Fatal error: require',
+           'There seems to have been a slight problem with the database',
+           '<title>Index of \/<\/title>',
+           'Sitio en Mantenci&oacute;n',
+           'our webserver is unable to handle the traffic',
+           'This is to help pay for my now high bandwidth bill.',
+           'Sorry, the board is unavailable at the moment while we carry out some admin',
+           '<title>Server Too Busy<\/title>' );
+
+        foreach my $p (@patterns) {
+            if ( $stripped =~ /$p/i ) {
+              $p =~ s/</&lt;/g;
+              $p =~ s/>/&gt;/g;
+              $p =~ s/\\//g;
+              $reason = "Pattern: $p";
+              return 0;
+            }
+        }
+
+        my @dual = (
+            'temporarily unavailable:scheduled maintenance',
+            'temporarily unavailable:maintenance mode',
+            'sorry:currently under maintenance',
+            'failed to open stream:Fatal error' );
+
+        foreach my $d (@dual) {
+            my @p = split( ':', $d );
+            if ( ( $stripped =~ /$p[0]/i ) && ( $c =~ /$p[1]/i ) ){
+                $reason = "Pattern: $p[0] AND $p[1]";
+                return 0;
+            }
+        }
+
+    }
+
+    return 1;
+}
+
+sub available_msg
+{
+    my ( $url, $email, $hash, $last, $elapsed ) = @_;
+
+    my $message =<<EOM;
+From: noreply\@l8tr.org
+Reply-To: l8tr\@jgc.org
+To: $email
+Subject: l8tr: A web page we were monitoring for you is now available
+
+The following web page is now available (downloaded successfully in ${elapsed}s):
+
+$url
+
+If you still have difficulty accessing that web page you can use l8tr.org's cached version of the page which is accessible here:
+
+http://l8tr.org/cached/$hash/$last/$email/
+
+This cached version of the page will be available for a week and will then be automatically deleted.
+
+Thank you for using l8tr.org!
+
+BETA NOTE: l8tr.org is currently in beta mode.  If you experience a problem
+with the service please email me at l8tr\@jgc.org.  I am very interested to
+hear about web pages that l8tr.org says are available, but you cannot contact
+them.   If the URL above is not working for you please forward this message
+to me so I can fix the bug!
+---
+http://l8tr.org/
+EOM
+
+    return $message;
+}
+
+
+sub failed_msg
+{
+    my ( $url, $email ) = @_;
+
+
+    my $message =<<EOM;
+From: noreply\@l8tr.org
+Reply-To: l8tr\@jgc.org
+To: $email
+Subject: l8tr: We have stopped monitoring a web page
+
+The following web page has not been available for more than a week.  l8tr.org is no longer monitoring it for availability.
+
+$url
+
+If you would like to restart monitoring of this page please click the following link:
+
+http://l8tr.org/cgi-bin/l8tr.pl?url=$url&email=$email&action=monitor
+
+Thank you for using l8tr.org!
+
+BETA NOTE: l8tr.org is currently in beta mode.  If you experience a problem
+with the service please email me at l8tr\@jgc.org.  I am very interested to
+hear about web pages that l8tr.org says are available, but you cannot contact
+them.   If the URL above is not working for you please forward this message
+to me so I can fix the bug!
+---
+http://l8tr.org/
+EOM
+
+    return $message;
+}
